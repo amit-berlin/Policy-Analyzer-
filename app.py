@@ -1,72 +1,97 @@
 import streamlit as st
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.llms import HuggingFaceHub
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from nltk.sentiment import SentimentIntensityAnalyzer
-import nltk
+import fitz  # PyMuPDF for PDF text extraction
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from textblob import TextBlob
+import numpy as np
+import pandas as pd
 
-nltk.download("vader_lexicon")
+# ------------------------
+# Helper: Extract PDF text
+# ------------------------
+def extract_pdf_text(pdf_file):
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
 
-# ------------------- Title -------------------
-st.title("Zero-Hallucination Policy QA & Citizen Feedback Agent")
+# ------------------------
+# Helper: Chunk text
+# ------------------------
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
-# ------------------- PDF Upload -------------------
-pdf = st.file_uploader("Upload a Government Policy PDF", type=["pdf"])
-if pdf:
-    pdf_reader = PdfReader(pdf)
-    text = "".join([page.extract_text() for page in pdf_reader.pages])
+# ------------------------
+# Agent 1-3: RAG-lite Chat
+# ------------------------
+def rag_chat(query, chunks):
+    vectorizer = TfidfVectorizer().fit(chunks + [query])
+    vectors = vectorizer.transform(chunks + [query])
+    sims = cosine_similarity(vectors[-1], vectors[:-1]).flatten()
+    best_idx = sims.argmax()
+    best_chunk = chunks[best_idx]
+    confidence = sims[best_idx]
+    return best_chunk, confidence
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    docs = splitter.split_text(text)
+# ------------------------
+# Citizen Feedback Analyzer
+# ------------------------
+def analyze_feedback(feedback_list):
+    results = []
+    for fb in feedback_list:
+        polarity = TextBlob(fb).sentiment.polarity
+        sentiment = "Positive" if polarity > 0 else "Negative" if polarity < 0 else "Neutral"
+        results.append({"feedback": fb, "sentiment": sentiment})
+    return pd.DataFrame(results)
 
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = FAISS.from_texts(docs, embeddings)
+# ------------------------
+# Impact Scoring (Toy ML)
+# ------------------------
+def compute_impact(before, after):
+    try:
+        impact = ((after - before) / before) * 100
+        return round(impact, 2)
+    except ZeroDivisionError:
+        return 0
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+# ------------------------
+# Streamlit UI
+# ------------------------
+st.title("🇮🇳 National AI Policy Intelligence MVP")
 
-    llm = HuggingFaceHub(
-        repo_id="google/flan-t5-small", model_kwargs={"temperature": 0, "max_length": 256}
-    )
+st.sidebar.header("Upload Policy PDF")
+pdf_file = st.sidebar.file_uploader("Upload a Policy Document", type="pdf")
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": PromptTemplate(
-            input_variables=["context","question"],
-            template="Use only the context to answer.\nContext: {context}\nQuestion: {question}\nAnswer:"
-        )}
-    )
+if pdf_file:
+    text = extract_pdf_text(pdf_file)
+    chunks = chunk_text(text)
 
-    st.success("✅ Policy Document Processed")
+    st.subheader("Ask a Question (Policy RAG)")
+    query = st.text_input("Enter your policy-related question:")
 
-    # ------------------- QA Section -------------------
-    query = st.text_input("Ask a policy-related question:")
     if query:
-        agent1 = qa_chain.run(query)  # Agent 1: Retrieval Answer
-        agent2 = "EVIDENCE OK" if query.lower().split()[0] in agent1.lower() else "EVIDENCE CHECK"  # Agent 2
-        agent3 = agent1 if agent2 == "EVIDENCE OK" else "Not enough evidence in policy."
-        agent4 = f"Final Answer: {agent3}"  # Agent 3 summarizer
-        st.markdown(f"**Agent 1 (Retriever):** {agent1}")
-        st.markdown(f"**Agent 2 (Evidence Check):** {agent2}")
-        st.markdown(f"**Agent 3 (Verifier):** {agent3}")
-        st.markdown(f"**Agent 4 (Final Reply):** {agent4}")
+        answer, score = rag_chat(query, chunks)
+        st.markdown("### Agentic Answer")
+        st.write(answer)
+        st.caption(f"Confidence Score: {round(score,2)}")
 
-# ------------------- Citizen Feedback -------------------
-st.subheader("Citizen Feedback Analysis")
-feedbacks = st.text_area("Paste citizen feedback (one per line):")
-if feedbacks:
-    sia = SentimentIntensityAnalyzer()
-    rows, total = [], 0
-    for fb in feedbacks.splitlines():
-        score = sia.polarity_scores(fb)["compound"]
-        rows.append((fb, score))
-        total += score
-    avg = total / len(rows)
+    # Citizen Feedback Section
+    st.subheader("Citizen Feedback Analysis")
+    feedback_input = st.text_area("Paste citizen feedback (one per line):")
+    if feedback_input:
+        feedback_list = feedback_input.strip().split("\n")
+        df = analyze_feedback(feedback_list)
+        st.dataframe(df)
 
-    st.table(rows)
-    st.write(f"📊 Avg Sentiment Score: {avg:.2f}")
+    # Impact Scoring
+    st.subheader("Impact Measurement")
+    before = st.number_input("Metric Before Policy", value=100)
+    after = st.number_input("Metric After Policy", value=120)
+    if st.button("Compute Impact"):
+        impact = compute_impact(before, after)
+        st.success(f"Estimated Impact: {impact}% change")
+
+else:
+    st.info("⬅️ Upload a policy PDF to start")
